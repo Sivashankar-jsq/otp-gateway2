@@ -1,0 +1,143 @@
+name: Pull Request (main)
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+    branches:
+      - main
+  push:
+    branches:
+      - "main"
+
+env:
+  AWS_ROLE_ARN: arn:aws:iam::154624791821:role/terraform-dev
+  AWS_ACCOUNT_ID: 154624791821
+  AWS_ROLE_DURATION_SECONDS: 1200
+  AWS_DEFAULT_REGION: us-west-2
+
+  AWS_CODEARTIFACT_DOMAIN: jsq
+  AWS_CODEARTIFACT_REPO: jsq-154624791821.d.codeartifact.us-west-2.amazonaws.com/npm/npm-composite
+
+  CACHE_REPO: docker-registry.docker-registry:5000
+  CACHE_INSECURE: true
+
+jobs:
+  prerequisites:
+    name: Prerequisites
+    runs-on: junipersquare-1vcpu-2gb-amd
+    outputs:
+      npm-token: ${{ steps.get-codeartifact-auth-token.outputs.npm-token }}
+    steps:
+      - name: Configure AWS Credentials
+        id: configure-aws-credentials
+        uses: aws-actions/configure-aws-credentials@05b148adc31e091bafbaf404f745055d4d3bc9d2
+        with:
+          aws-access-key-id: ${{ secrets.TERRAFORM_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.TERRAFORM_AWS_SECRET_ACCESS_KEY }}
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          role-duration-seconds: ${{ env.AWS_ROLE_DURATION_SECONDS }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: Install AWS CLI
+        id: install-aws-cli
+        uses: unfor19/install-aws-cli-action@24910e063da536a1f28f8dd12bc88f77f438bab9
+        with:
+          version: 2
+
+      - name: Get Code Artifact Auth Token
+        id: get-codeartifact-auth-token
+        run: echo "::set-output name=npm-token::$(aws codeartifact get-authorization-token --domain ${{ env.AWS_CODEARTIFACT_DOMAIN}} --domain-owner ${{ env.AWS_ACCOUNT_ID }} --query authorizationToken --output text --region ${{ env.AWS_DEFAULT_REGION }})"
+
+  docker-build:
+    name: Docker Build
+    strategy:
+      fail-fast: true
+      matrix:
+        config:
+          [
+            { "arch": "amd64", "runner": "junipersquare-1vcpu-2gb-amd" },
+            { "arch": "arm64", "runner": "junipersquare-1vcpu-2gb-arm" },
+          ]
+    runs-on: "${{ matrix.config.runner }}"
+    needs: [prerequisites]
+
+    steps:
+      - name: Git Checkout
+        id: git-checkout
+        uses: actions/checkout@2541b1294d2704b0964813337f33b291d3f8596b
+
+      - name: Login to Dockerhub
+        uses: docker/login-action@49ed152c8eca782a232dede0303416e8f356c37b
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_PASSWORD }}
+
+      - name: Set up Docker Context
+        id: setup-docker-context
+        run: docker context create builders
+
+      - name: Set up Docker Buildx
+        id: setup-docker-buildx
+        uses: docker/setup-buildx-action@dc7b9719a96d48369863986a06765841d7ea23f6
+        with:
+          endpoint: builders
+          config-inline: |
+            [registry."${{ env.CACHE_REPO }}"]
+              http = true
+              insecure = ${{ env.CACHE_INSECURE }}
+
+      - name: Build and Push to AWS Elastic Container Registry
+        id: build-and-push
+        uses: docker/build-push-action@e551b19e49efd4e98792db7592c17c09b89db8d8
+        with:
+          context: .
+          file: Dockerfile
+          push: false
+          platforms: linux/${{ matrix.config.arch }}
+          outputs: type=oci,dest=${{ github.event.repository.name }}-${{ matrix.config.arch }}.tar
+          cache-from: type=registry,ref=${{ env.CACHE_REPO }}/${{ github.event.repository.name }}:buildcache-${{ matrix.config.arch }}
+          cache-to: type=registry,ref=${{ env.CACHE_REPO }}/${{ github.event.repository.name }}:buildcache-${{ matrix.config.arch }},mode=max
+
+      - name: Create SBOM
+        id: create-sbom
+        uses: anchore/sbom-action@b5042e9d19d8b32849779bfe17673ff84aec702d
+        with:
+          image: ${{ github.event.repository.name }}-${{ matrix.config.arch }}.tar
+          output-file: ${{ github.event.repository.name }}-sbom.spdx.json
+
+      - name: Scan SBOM
+        id: scan-sbom
+        uses: anchore/scan-action@36bd2c8c3b017db8c98ffbb5f866533890b7aef1
+        with:
+          sbom: ${{ github.event.repository.name }}-${{ matrix.config.arch }}-sbom.spdx.json
+          fail-build: false
+  build:
+    name: build
+    if: ${{ github.event.action != 'closed' || (github.event.action == 'closed' && github.event.pull_request.merged == true) }}
+    runs-on: [self-hosted, linux, "x64"]
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions/setup-node@v3
+        with:
+          node-version: "18"
+      - name: make sure we have yarn
+        run: corepack enable
+      - uses: actions/setup-node@v3
+        with:
+          node-version: "18"
+          cache: "yarn"
+      - name: Install dependencies
+        run: |
+          yarn install --immutable --immutable-cache
+      - name: Lint
+        run: |
+          yarn lintcheck
+      - name: Build
+        run: |
+          yarn build
+      - name: Test
+        run: |
+          yarn test

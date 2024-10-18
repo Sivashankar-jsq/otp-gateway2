@@ -1,0 +1,203 @@
+# Please pin 3rd party Github Actions to a specific commit sha.
+
+name: Build and Push Container Image
+
+on:
+  release:
+    types: [published]
+
+env:
+  # These could change
+  HELM_CHART_VERSION: v1.0.335
+  MANIFEST_REPO: junipersquare/application-manifests
+
+  # Probably don't need to change these
+  AWS_ACCOUNT_ID: 847118582397
+  AWS_DEFAULT_REGION: us-west-2
+  AWS_ROLE_ARN: arn:aws:iam::847118582397:role/terraform-dev
+  AWS_ROLE_DURATION_SECONDS: 1200
+  CACHE_INSECURE: true
+  CACHE_REPO: docker-registry.docker-registry:5000
+  YAML_REPO: https://github.com/junipersquare/application-manifests.git
+
+jobs:
+  docker-build:
+    name: Docker Build
+    strategy:
+      fail-fast: true
+      matrix:
+        config:
+          [
+            { "arch": "amd64", "runner": "junipersquare-1vcpu-2gb-amd" },
+            { "arch": "arm64", "runner": "junipersquare-1vcpu-2gb-arm" },
+          ]
+    runs-on: "${{ matrix.config.runner }}"
+    steps:
+      - name: Git Checkout
+        id: git-checkout
+        uses: actions/checkout@2541b1294d2704b0964813337f33b291d3f8596b
+
+      - name: Login to Dockerhub
+        uses: docker/login-action@49ed152c8eca782a232dede0303416e8f356c37b
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_PASSWORD }}
+
+      - name: Configure AWS Credentials
+        id: configure-aws-credentials
+        uses: aws-actions/configure-aws-credentials@05b148adc31e091bafbaf404f745055d4d3bc9d2
+        with:
+          aws-access-key-id: ${{ secrets.TERRAFORM_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.TERRAFORM_AWS_SECRET_ACCESS_KEY }}
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          role-duration-seconds: ${{ env.AWS_ROLE_DURATION_SECONDS }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: Login to AWS Elastic Container Registry
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@b874a33292cc9887d2e80bc63f6f1a11fccb4a7b
+
+      - name: Create Registry
+        uses: int128/create-ecr-repository-action@27f3792ed9a92a1dacc078ca944b844dedfe270d
+        id: create-registry
+        with:
+          repository: ${{ github.event.repository.name }}
+          public: false
+
+      - name: Set up Docker Context
+        id: setup-docker-context
+        run: docker context create builders
+
+      - name: Set up Docker Buildx
+        id: setup-docker-buildx
+        uses: docker/setup-buildx-action@dc7b9719a96d48369863986a06765841d7ea23f6
+        with:
+          endpoint: builders
+          config-inline: |
+            [registry."${{ env.CACHE_REPO }}"]
+              http = true
+              insecure = ${{ env.CACHE_INSECURE }}
+
+      - name: Set Docker Release Tag
+        run: echo "RELEASE_VERSION=${GITHUB_REF#refs/*/}" >> $GITHUB_ENV
+
+      - name: Build and Push to AWS Elastic Container Registry
+        id: build-and-push
+        uses: docker/build-push-action@e551b19e49efd4e98792db7592c17c09b89db8d8
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_DEFAULT_REGION }}.amazonaws.com/${{ github.event.repository.name }}:${{ env.RELEASE_VERSION }}-${{ matrix.config.arch }}
+          platforms: linux/${{ matrix.config.arch }}
+          cache-from: type=registry,ref=${{ env.CACHE_REPO }}/${{ github.event.repository.name }}:buildcache-${{ matrix.config.arch }}
+          cache-to: type=registry,ref=${{ env.CACHE_REPO }}/${{ github.event.repository.name }}:buildcache-${{ matrix.config.arch }},mode=max
+
+  combine-images:
+    name: Combine Docker Images
+    runs-on: [self-hosted, linux]
+    needs: [docker-build]
+    steps:
+      - name: Configure AWS Credentials
+        id: configure-aws-credentials
+        uses: aws-actions/configure-aws-credentials@05b148adc31e091bafbaf404f745055d4d3bc9d2
+        with:
+          aws-access-key-id: ${{ secrets.TERRAFORM_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.TERRAFORM_AWS_SECRET_ACCESS_KEY }}
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          role-duration-seconds: ${{ env.AWS_ROLE_DURATION_SECONDS }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: Login to AWS Elastic Container Registry
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@b874a33292cc9887d2e80bc63f6f1a11fccb4a7b
+
+      - name: Set Docker Release Tag
+        run: echo "RELEASE_VERSION=${GITHUB_REF#refs/*/}" >> $GITHUB_ENV
+
+      - name: Combine container images
+        id: combine-docker-images
+        run: |
+          docker manifest create \
+          ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_DEFAULT_REGION }}.amazonaws.com/${{ github.event.repository.name }}:${{ env.RELEASE_VERSION }} \
+          --amend ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_DEFAULT_REGION }}.amazonaws.com/${{ github.event.repository.name }}:${{ env.RELEASE_VERSION }}-amd64 \
+          --amend ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_DEFAULT_REGION }}.amazonaws.com/${{ github.event.repository.name }}:${{ env.RELEASE_VERSION }}-arm64
+          docker manifest push ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_DEFAULT_REGION }}.amazonaws.com/${{ github.event.repository.name }}:${{ env.RELEASE_VERSION }}
+
+  deploy:
+    name: Deploy K8s Manifests
+    runs-on: [junipersquare-1vcpu-2gb-amd]
+    needs: [docker-build]
+    strategy:
+      matrix:
+        include:
+          - environment: test
+      fail-fast: false
+    steps:
+      - name: Git Checkout
+        id: git-checkout
+        uses: actions/checkout@2541b1294d2704b0964813337f33b291d3f8596b
+
+      - name: Create GitHub deployment
+        id: create-github-deployment
+        uses: chrnorm/deployment-action@1b599fe41a0ef1f95191e7f2eec4743f2d7dfc48
+        with:
+          token: "${{ github.token }}"
+          environment-url: https://change.me
+          environment: ${{ matrix.environment }}
+
+      - uses: azure/setup-helm@b5b231a831f96336bbfeccc1329990f0005c5bb1
+        with:
+          version: "v3.9.0" # default is latest (stable)
+        id: install
+
+      - name: Log in to Helm registry
+        run: |
+          echo $GCR | helm registry login ghcr.io --username ${{ github.actor }} --password ${{ secrets.GITHUB_TOKEN }}
+        env:
+          HELM_EXPERIMENTAL_OCI: 1
+
+      - name: Set Docker Release Tag
+        run: echo "RELEASE_VERSION=${GITHUB_REF#refs/*/}" >> $GITHUB_ENV
+
+      - name: Create K8s Manifest
+        run: |
+          mkdir -p ${{ matrix.environment }}/manifests && \
+          helm template \
+            --debug \
+            --set global.image.repository=${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_DEFAULT_REGION }}.amazonaws.com/${{ github.event.repository.name }} \
+            --set global.image.tag=$RELEASE_VERSION \
+            --set global.github.deploymentId=${{ steps.create-github-deployment.outputs.deployment_id }} \
+            --namespace ${{ github.event.repository.name  }} --set global.namespace=${{ github.event.repository.name }} --create-namespace  \
+            ${{ matrix.environment }}-${{ github.event.repository.name }} oci://ghcr.io/junipersquare/universal-chart --version ${{ env.HELM_CHART_VERSION }} -f ./infra/values-${{ matrix.environment }}.yaml > ${{ matrix.environment }}/manifests/manifest.yaml
+
+      - name: Create config.json
+        run: |
+          jq --null-input \
+            --arg appName "${{ github.event.repository.name }}" \
+            --arg userGivenName "${{ github.event.repository.name }}" \
+            --arg destNamespace "${{ github.event.repository.name }}" \
+            --arg destServer "https://kubernetes.default.svc" \
+            --arg srcPath "${{ github.event.repository.name }}/${{ matrix.environment }}/manifests" \
+            --arg srcRepoURL "${{ env.YAML_REPO }}" \
+            --arg srcTargetRevision "${{ github.event.repository.name }}-${{ env.RELEASE_VERSION }}+${{ matrix.environment }}" \
+            --arg labels "" \
+            --arg deploymentId "${{ steps.create-github-deployment.outputs.deployment_id }}" \
+            --arg appRepo "${{ github.repository }}" \
+            --arg version "${{ env.RELEASE_VERSION }}" \
+            '{ appName: $appName, userGivenName: $userGivenName, destNamespace: $destNamespace, destServer: $destServer, srcPath: $srcPath, srcRepoURL: $srcRepoURL, srcTargetRevision: $srcTargetRevision, labels: $labels, deploymentId: $deploymentId, appRepo: $appRepo, version: $version }' > ${{ matrix.environment }}/config.json
+
+      - name: Push manifest to YAML Repo
+        id: push-manifest
+        uses: bonus83/copy_commit_push_tag@9b42a459878a8858c4dc38f2e40ccb4ba17fdde8
+        env:
+          API_TOKEN_GITHUB: ${{ secrets.GITOPS_TOKEN }}
+        with:
+          source_file: "${{ matrix.environment }}"
+          destination_repo: "${{ env.MANIFEST_REPO }}"
+          destination_folder: "${{ github.event.repository.name }}"
+          user_email: "junibot@junipersquare.com"
+          user_name: "junibot@junipersquare.com"
+          commit_message: "Deploying ${{ env.RELEASE_VERSION }} to ${{ matrix.environment }}."
+          commit_tag: "${{ github.event.repository.name }}-${{ env.RELEASE_VERSION }}+${{ matrix.environment }}"

@@ -1,0 +1,9 @@
+
+# Snyk (https://snyk.io) policy file, patches or ignores known vulnerabilities.
+version: v1.25.0
+# Exclude directories from scans: Tests, vendor code, one-off scripts, alembic revisions
+#exclude:
+# global:
+#   - jsq/tests/**
+#   - jsq/vendor/**
+#   - jsq/client/src/tests/**

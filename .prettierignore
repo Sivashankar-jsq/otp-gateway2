@@ -1,0 +1,6 @@
+build
+coverage
+# Helm templates are not actually YAML:
+deploy/charts/templates/**/*.yaml
+.yarn/
+.pnp*
